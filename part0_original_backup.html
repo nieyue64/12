@@ -4996,91 +4996,11 @@ window.TU = window.TU || {};
     }
   }
 
-  /**
-   * @function runAsync
-   * @description Async-safe version of run() that properly catches Promise rejections.
-   * Unlike run(), this returns a Promise and will NOT silently swallow async errors.
-   * Worker hangs, IDB write failures, and audio context errors will surface to console.
-   * @param {string} tag - Error context tag
-   * @param {Function} fn - Async function to execute
-   * @param {Object} [opts] - Options (same as run: level, toastMessage, rethrow, fallback)
-   * @returns {Promise<*>} Result of fn or opts.fallback on error
-   */
-  async function runAsync(tag, fn, opts) {
-    try {
-      return await fn();
-    } catch (e) {
-      const o = opts || {};
-      const level = o.level || "error";
-      const entry = { tag: tag || "unknown", error: e, at: Date.now(), async: true };
-      errors.push(entry);
-      errors.length > maxErrors && errors.splice(0, errors.length - maxErrors);
-      try {
-        log(level, "[Async] " + tag, e);
-      } catch (_) { /* logging itself failed, nothing we can do */ }
-      if (o.toastMessage) toast(o.toastMessage, o.toastMs, o.toastKey || tag, o.cooldownMs);
-      if (o.rethrow) throw e;
-      return o.fallback;
-    }
-  }
-
-  /**
-   * @class GlobalErrorBoundary
-   * @description Centralized error boundary that tracks error rates and triggers
-   * circuit-breaker behavior when error count exceeds threshold within a window.
-   * Replaces scattered try/catch(e){} with structured error tracking.
-   */
-  const GlobalErrorBoundary = {
-    _windowMs: 10000,
-    _maxPerWindow: 25,
-    _windowErrors: [],
-    _circuitOpen: false,
-    _listeners: [],
-
-    /** Record an error occurrence and check circuit breaker */
-    record(tag, error) {
-      const now = Date.now();
-      this._windowErrors.push({ tag, error, at: now });
-      // Prune old entries outside the window
-      const cutoff = now - this._windowMs;
-      while (this._windowErrors.length > 0 && this._windowErrors[0].at < cutoff) {
-        this._windowErrors.shift();
-      }
-      // Circuit breaker: if too many errors in window, emit fatal
-      if (!this._circuitOpen && this._windowErrors.length >= this._maxPerWindow) {
-        this._circuitOpen = true;
-        console.error("[GlobalErrorBoundary] Circuit breaker OPEN: " + this._windowErrors.length + " errors in " + this._windowMs + "ms");
-        try {
-          window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("fatal:errorBoundary", {
-            count: this._windowErrors.length,
-            window: this._windowMs,
-            last: { tag, error }
-          });
-        } catch (_) {}
-      }
-      return this._circuitOpen;
-    },
-
-    /** Check if the circuit breaker is currently open */
-    isOpen() { return this._circuitOpen; },
-
-    /** Reset the circuit breaker (e.g., after user acknowledges) */
-    reset() {
-      this._circuitOpen = false;
-      this._windowErrors.length = 0;
-    },
-
-    /** Get recent errors for diagnostics */
-    getRecent() { return this._windowErrors.slice(); }
-  };
-
   TU.Safe = {
     run,
-    runAsync,
     toast,
     shouldFire,
-    errors,
-    GlobalErrorBoundary
+    errors
   };
 })();
 document.getElementById('error-toggle')?.addEventListener('click', function() {
@@ -26968,15 +26888,13 @@ window.TU;
                 var hasLS = !1;
                 try {
                   hasLS = !!window.AppServices.get("storage").get(SaveSystem.KEY);
-                } catch (e) {
-                  console.warn('[SavePrompt] LS check failed:', e);
+                } catch {
                   hasLS = !1;
                 }
                 var hasIDB = !1;
                 if (!hasLS && !FLAGS.disableIDBSave) try {
                   hasIDB = !!(await idb.get(SaveSystem.KEY));
-                } catch (e) {
-                  console.warn('[SavePrompt] IDB check failed:', e);
+                } catch {
                   hasIDB = !1;
                 }
                 if (!hasLS && !hasIDB) {
@@ -27159,7 +27077,7 @@ window.TU;
                     idb.set(SaveSystem.KEY, payload).then(function (ok) {
                       ok && !lsOk && ToastRef && ToastRef.show && ("manual" === reason && ToastRef.show("💾 已保存（IndexedDB）"), "autosave" === reason && ToastRef.show("✅ 自动保存（IndexedDB）", 1100));
                       // If localStorage fails, show "saved (IDB)" to avoid user thinking save failed
-                    }).catch(e => { console.warn('[IDB write failed]', e); TU.Safe && TU.Safe.GlobalErrorBoundary && TU.Safe.GlobalErrorBoundary.record('idb:write', e); });
+                    }).catch(_ => {});
                   } catch(e){console.warn('[Catch]',e);}
                   if (lsOk) try {
                     ToastRef && ToastRef.show && ("manual" === reason && ToastRef.show("💾 已保存"), "autosave" === reason && ToastRef.show("✅ 自动保存", 1100));
@@ -28965,15 +28883,16 @@ window.TU;
           Game = TU.Game,
           InputManager = TU.InputManager,
           AudioManager = TU.AudioManager;
-        // [REFACTOR Part0] game:init:post double-trigger fix:
-        // Game.prototype.init already emits 'game:init:post' at end of init().
-        // This wrapper was re-emitting it, causing duplicate lifecycle events,
-        // first-frame stutter spikes, and double-initialization of subsystems.
-        // The wrapper is now a no-op guard; downstream listeners should use
-        // the single canonical emission inside Game.prototype.init.
         if (Game && Game.prototype && !Game.prototype.__tuGameReadyEvent) {
           Game.prototype.__tuGameReadyEvent = !0;
-          // No longer wrapping Game.prototype.init - the original already emits game:init:post
+          const _init = Game.prototype.init;
+          "function" == typeof _init && (Game.prototype.init = async function (...args) {
+            const r = await _init.apply(this, args);
+            try {
+              window.GameEvents.emit("game:init:post", this);
+            } catch(e){console.warn('[Catch]',e);}
+            return r;
+          });
         }
         if (InputManager && InputManager.prototype && !InputManager.prototype.__tuInputSafety) {
           InputManager.prototype.__tuInputSafety = !0;
@@ -36247,8 +36166,7 @@ window.addEventListener("load", () => {
   function readStorage(key) {
     try {
       return storage ? storage.get(key) : null;
-    } catch (e) {
-      console.warn('[StorageAdapter] readStorage failed:', key, e);
+    } catch {
       return null;
     }
   }
@@ -36257,11 +36175,7 @@ window.addEventListener("load", () => {
     try {
       storage && storage.set(key, val);
       return true;
-    } catch (e) {
-      console.warn('[StorageAdapter] writeStorage failed:', key, e);
-      if (e && e.name === 'QuotaExceededError') {
-        TU.Safe && TU.Safe.GlobalErrorBoundary && TU.Safe.GlobalErrorBoundary.record('storage:quota', e);
-      }
+    } catch {
       return false;
     }
   }
@@ -36270,8 +36184,7 @@ window.addEventListener("load", () => {
     try {
       storage && storage.remove(key);
       return true;
-    } catch (e) {
-      console.warn('[StorageAdapter] removeStorage failed:', key, e);
+    } catch {
       return false;
     }
   }
@@ -36605,12 +36518,7 @@ window.addEventListener("load", () => {
     let idbOk = false;
     if ("1" !== readStorage("TU_DISABLE_IDB_SAVE")) try {
       idbOk = await idb.set(key, payload);
-    } catch (e) {
-      console.error('[writeSave] IDB write failed:', e);
-      if (e && e.name === 'QuotaExceededError') {
-        window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("ui:toast", "⚠️ IndexedDB 存储空间不足", 3000);
-      }
-      TU.Safe && TU.Safe.GlobalErrorBoundary && TU.Safe.GlobalErrorBoundary.record('idb:writeSave', e);
+    } catch {
       idbOk = false;
     }
     return { ok: lsOk || idbOk, lsOk, idbOk };
@@ -36799,9 +36707,7 @@ window.addEventListener("load", () => {
     let ser = "";
     try {
       ser = jstringify(payloadFull);
-    } catch (e) {
-      console.error('[SaveSystem] Serialization failed:', e);
-      TU.Safe && TU.Safe.GlobalErrorBoundary && TU.Safe.GlobalErrorBoundary.record('save:serialize', e);
+    } catch {
       window.GameEvents && window.GameEvents.emit && window.GameEvents.emit("ui:toast", "⚠️ 存档序列化失败", 2600);
       return;
     }
