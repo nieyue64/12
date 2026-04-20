@@ -5478,15 +5478,12 @@ window.Events = {
   once: function(event, cb, opts) { return window.GameEvents.once(event, cb, opts); }
 };
 
-// --- TU Canvas State Optimizer (Scoped) ---
-// [REFACTOR Part3] Scoped to game canvas only. No longer hijacks global HTMLCanvasElement.
-// The CanvasOptimizer is applied explicitly when the game canvas is created.
+// --- TU Canvas State Optimizer Injected ---
 !function () {
   const originalGetContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type, options) {
     const ctx = originalGetContext.call(this, type, options);
-    // Only optimize the game canvas (id="game") to avoid interfering with other canvases
-    if ("2d" === type && ctx && !ctx.__tu_optimized && this.id === "game") {
+    if ("2d" === type && ctx && !ctx.__tu_optimized) {
       ctx.__tu_optimized = !0;
       let currentAlpha = 1,
         currentFill = "#000000";
@@ -9545,21 +9542,8 @@ class SaveSystem {
     // Performance enhancement: also store diff into world object dynamically so generateChunk doesn't need to check game singleton
     const w = window.AppServices.get("world");
     w && (w._saveDiff = this.diff, w._saveDiffChunks = this.diffChunks);
-    // [REFACTOR Part2] Absorbed from __logicMarkTilePatched: update world versions directly
-    const _w = window.AppServices.get("world");
-    if (_w) {
-      _w._tileVersion = 1 + (0 | _w._tileVersion) | 0;
-      if ((0 | newId) === (window.BLOCK && window.BLOCK.WATER || 27)) {
-        _w._waterVersion = 1 + (0 | _w._waterVersion) | 0;
-        if (typeof __tuBumpWaterChunkVer === 'function') __tuBumpWaterChunkVer(_w, 0 | x, 0 | y);
-      }
-    }
     try {
       window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('renderer:invalidateRegion', x, y, x, y);
-    } catch(e){console.warn('[Catch]',e);}
-    // [REFACTOR Part2] Emit save:tileMarked event for decoupled listeners (machines, etc.)
-    try {
-      window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('save:tileMarked', { x: 0|x, y: 0|y, newId: 0|newId, oldId: oldId });
     } catch(e){console.warn('[Catch]',e);}
   }
   tickAutosave(dt) {
@@ -10373,150 +10357,6 @@ const CONFIG = Object.freeze({
   });
 // Block IDs 0-161: frozen constants enable V8 optimization, stable IDs for serialization/networking
 window.Constants = Constants;
-
-// ============================================================================
-// [REFACTOR Part4] BlockRegistry - Palette Mapping for Save File Compatibility
-// ============================================================================
-// Problem: Block IDs are assigned by position in BLOCK object. If load order
-// changes (e.g. new blocks added, patches reordered), old saves break because
-// tile data references IDs that now map to different blocks.
-// Solution: Save a name->ID palette in the save header. On load, remap IDs
-// from the save palette to the current runtime palette.
-window.BlockRegistry = {
-  /** Build palette from current BLOCK constants: { name: id } */
-  buildPalette() {
-    const BLOCK = window.Constants && window.Constants.BLOCK ? window.Constants.BLOCK : window.BLOCK;
-    if (!BLOCK) return {};
-    const palette = {};
-    for (const [name, id] of Object.entries(BLOCK)) {
-      if (typeof id === 'number') palette[name] = id;
-    }
-    return palette;
-  },
-
-  /** Compute remapping table from saved palette to current palette.
-   *  Returns null if no remapping needed, or Int32Array[256] of oldId->newId.
-   */
-  computeRemap(savedPalette) {
-    if (!savedPalette || typeof savedPalette !== 'object') return null;
-    const current = this.buildPalette();
-    let needsRemap = false;
-    const remap = new Int32Array(256);
-    for (let i = 0; i < 256; i++) remap[i] = i; // identity by default
-
-    for (const [name, savedId] of Object.entries(savedPalette)) {
-      const currentId = current[name];
-      if (currentId !== undefined && currentId !== savedId) {
-        remap[savedId] = currentId;
-        needsRemap = true;
-      }
-    }
-    return needsRemap ? remap : null;
-  },
-
-  /** Apply remap to a flat tile array in-place */
-  applyRemap(tilesFlat, remap) {
-    if (!remap || !tilesFlat) return;
-    for (let i = 0, len = tilesFlat.length; i < len; i++) {
-      const old = tilesFlat[i];
-      if (old >= 0 && old < 256) tilesFlat[i] = remap[old];
-    }
-  },
-
-  /** Serialize palette for save header */
-  serialize() { return JSON.stringify(this.buildPalette()); },
-
-  /** Deserialize palette from save header */
-  deserialize(str) {
-    try { return JSON.parse(str); } catch { return null; }
-  }
-};
-if (window.AppServices) window.AppServices.register('blockRegistry', window.BlockRegistry);
-
-// ============================================================================
-// [REFACTOR Part4] StorageAdapter - Unified LS/IDB Degradation with Visibility
-// ============================================================================
-// Problem: Storage failures (quota exceeded, IDB unavailable) are silently
-// swallowed, leading to "zombie saves" where the user thinks they saved but
-// data was lost. Multiple places implement ad-hoc LS->IDB fallback.
-// Solution: A single StorageAdapter that manages the degradation chain and
-// exposes real errors to the UI.
-window.StorageAdapter = {
-  _mode: 'ls',   // 'ls' | 'idb' | 'degraded' | 'failed'
-  _idb: null,
-  _storage: null,
-  _listeners: [],
-
-  init(storage, idb) {
-    this._storage = storage;
-    this._idb = idb;
-    this._mode = storage ? 'ls' : (idb ? 'idb' : 'failed');
-  },
-
-  getMode() { return this._mode; },
-
-  /** Attempt to write, with automatic degradation chain */
-  async write(key, value) {
-    let lsOk = false, idbOk = false;
-    // Try localStorage first
-    if (this._storage && this._mode !== 'idb') {
-      try {
-        this._storage.set(key, value);
-        lsOk = true;
-      } catch (e) {
-        console.warn('[StorageAdapter] LS write failed:', e);
-        if (e && e.name === 'QuotaExceededError') {
-          this._mode = 'idb'; // Degrade to IDB
-          this._notify('degraded', 'ls_quota', e);
-        }
-      }
-    }
-    // Try IDB as backup or primary
-    if (this._idb && (this._mode === 'idb' || !lsOk)) {
-      try {
-        idbOk = await this._idb.set(key, value);
-      } catch (e) {
-        console.error('[StorageAdapter] IDB write failed:', e);
-        this._notify('error', 'idb_write', e);
-      }
-    }
-    const ok = lsOk || idbOk;
-    if (!ok) {
-      this._mode = 'failed';
-      this._notify('failed', 'all_write', null);
-    }
-    return { ok, lsOk, idbOk, mode: this._mode };
-  },
-
-  /** Read with automatic degradation */
-  async read(key) {
-    // Try LS first
-    if (this._storage) {
-      try {
-        const val = this._storage.get(key);
-        if (val !== null && val !== undefined) return val;
-      } catch (e) { /* fall through to IDB */ }
-    }
-    // Try IDB
-    if (this._idb) {
-      try { return await this._idb.get(key); }
-      catch (e) { console.warn('[StorageAdapter] IDB read failed:', e); }
-    }
-    return null;
-  },
-
-  /** Register listener for degradation/error events */
-  onStatusChange(fn) { this._listeners.push(fn); },
-
-  _notify(status, reason, error) {
-    for (const fn of this._listeners) {
-      try { fn({ status, reason, error, mode: this._mode }); }
-      catch (e) { /* listener error */ }
-    }
-  }
-};
-if (window.AppServices) window.AppServices.register('storageAdapter', window.StorageAdapter);
-
 const BLOCK_DATA = {
     [BLOCK.AIR]: {
       name: "空气",
@@ -21281,8 +21121,6 @@ class Renderer {
       ctx.drawImage(fvlBuf, 0, 0);
     }
     ctx.restore();
-    // [REFACTOR Part3] Run registered pipeline stages after base postFX
-    this.runPostFxPipeline && this.runPostFxPipeline(time, depth01, reducedMotion);
     window.GameEvents && window.GameEvents.emit && window.GameEvents.emit('renderer:postFX:complete', this, time, depth01, reducedMotion);
   }
   /**
@@ -21526,41 +21364,6 @@ const RECIPES = [{
 Object.assign(window.TU, {
   Renderer: Renderer
 });
-// [REFACTOR Part3] PostFX Pipeline infrastructure
-// Instead of wrapping applyPostFX with layers of closures (onion model),
-// effects register as pipeline stages that run in explicit order.
-// This eliminates the fragile "temporary zeroing" pattern between layers.
-Renderer.prototype.postFxPipeline = [];
-/**
- * Register a post-processing stage. Stages run in priority order after base postFX.
- * @param {string} id - Unique stage identifier
- * @param {number} priority - Lower runs first (10=weather, 20=underwater, 30=custom)
- * @param {Function} fn - function(renderer, ctx, time, depth01, reducedMotion)
- */
-Renderer.prototype.registerPostFxStage = function(id, priority, fn) {
-  // Remove existing with same id
-  this.postFxPipeline = this.postFxPipeline.filter(s => s.id !== id);
-  this.postFxPipeline.push({ id, priority: priority || 0, fn });
-  this.postFxPipeline.sort((a, b) => a.priority - b.priority);
-};
-Renderer.prototype.runPostFxPipeline = function(time, depth01, reducedMotion) {
-  const pipeline = this.postFxPipeline;
-  if (!pipeline || !pipeline.length) return;
-  const ctx = this.ctx;
-  if (!ctx) return;
-  for (let i = 0, len = pipeline.length; i < len; i++) {
-    try {
-      pipeline[i].fn(this, ctx, time, depth01, reducedMotion);
-    } catch (e) {
-      console.warn('[PostFX Pipeline] Stage ' + pipeline[i].id + ' failed:', e);
-    }
-  }
-};
-// Pre-set flags for patches that are now superseded by the pipeline
-Renderer.prototype.__weatherPostTintInstalled = true;
-// NOTE: __weatherPostTintOptimized and __underwaterFogInstalled intentionally NOT set
-// They implement actual weather tint and underwater fog rendering.
-
 /**
  * Crafting system UI and logic for converting items into new items.
  * Displays recipe grid, ingredient requirements, and craft button.
@@ -23428,9 +23231,6 @@ class InputManager {
     });
     // [REFACTOR Part1] Absorbed from InputManager.__tuInputSafety patch:
     // Anti-stuck-key: reset all inputs on blur/visibility change
-    // Guard: only bind once per instance
-    if (this.__tuExtraBound) return;
-    this.__tuExtraBound = true;
     const resetMouseButtons = () => {
       game && game.input && (window.GameEvents.emit('input:set', 'mouseLeft', false), window.GameEvents.emit('input:set', 'mouseRight', false));
     };
@@ -26845,8 +26645,6 @@ window.TU;
           // Subtle grain (skip on low power)
           this._grainPattern && !lowFx && (ctx.globalAlpha = .045, ctx.fillStyle = this._grainPattern, ctx.fillRect(0, 0, 0 | w, 0 | h));
           ctx.restore();
-          // [REFACTOR Part5] Pipeline call in base override (since this replaces the native method)
-          this.runPostFxPipeline && this.runPostFxPipeline(time, depth01, reducedMotion);
         };
       }
       if (Game && Game.prototype) {
@@ -28513,10 +28311,14 @@ window.TU;
   // Extend SaveSystem.markTile to notify tile logic
   try {
     const SS = void 0 !== SaveSystem ? SaveSystem : TU.SaveSystem || null;
-    // [REFACTOR Part2] __logicMarkTilePatched ABSORBED into native SaveSystem.markTile()
-    // World _tileVersion and _waterVersion updates now happen inside markTile natively.
-    if (SS && SS.prototype) {
-      SS.prototype.__logicMarkTilePatched = !0; // Flag set to prevent re-patching
+    if (SS && SS.prototype && !SS.prototype.__logicMarkTilePatched) {
+      SS.prototype.__logicMarkTilePatched = !0;
+      const _mark = SS.prototype.markTile;
+      SS.prototype.markTile = function (x, y, newId) {
+        const r = _mark.apply(this, arguments),
+          world = window.AppServices.get("world");
+        return world && (world._tileVersion = 1 + (0 | world._tileVersion) | 0, (0 | newId) === (window.BLOCK && window.BLOCK.WATER || 27) && (world._waterVersion = 1 + (0 | world._waterVersion) | 0, __tuBumpWaterChunkVer(world, 0 | x, 0 | y))), r;
+      };
     }
   } catch(e){console.warn('[Catch]',e);}
   try {
@@ -30318,15 +30120,15 @@ window.TU;
             owner: owner
           });
           try {
-            // [REFACTOR Part2] Machine index sync via save:tileMarked event (was __machineIndexPatched)
-            if (!window.__tuMachineMarkTileListener) {
-              window.__tuMachineMarkTileListener = true;
-              window.GameEvents && window.GameEvents.on && window.GameEvents.on('save:tileMarked', e => {
-                const g = window.AppServices.get("game");
-                if (g && g._machines && !g._suppressMarkMachineSync && "function" == typeof g._syncMachineAt) {
-                  g._syncMachineAt(e.x, e.y, e.newId);
-                }
-              });
+            const SS = window.SaveSystem;
+            if (SS && SS.prototype && !SS.prototype.__machineIndexPatched) {
+              SS.prototype.__machineIndexPatched = !0;
+              const _mark = SS.prototype.markTile;
+              SS.prototype.markTile = function (x, y, newId) {
+                const r = _mark.apply(this, arguments),
+                  g = window.AppServices.get("game");
+                return g && g._machines && !g._suppressMarkMachineSync && "function" == typeof g._syncMachineAt && g._syncMachineAt(x, y, newId), r;
+              };
             }
           } catch(e){console.warn('[Catch]',e);}
         }
@@ -31174,19 +30976,10 @@ window.TU;
             return Date.now();
           }
         }
-        // [REFACTOR Part4] Worker source safety: _fnToExpr is used to extract method
-        // source code via toString() for Web Worker injection. This is fragile because:
-        // 1. Minification breaks toString() output
-        // 2. Closure context is lost (variables from outer scope aren't available in Worker)
-        // 3. Arrow functions stringify differently across engines
-        // FUTURE: Replace with constant template strings or PatchedWorldGenerator subclass.
-        // For now, add defensive checks and error reporting.
         function _fnToExpr(fn) {
           const s = fn + "";
-          if (!s || s === "function () { [native code] }" || s.length < 10) {
-            console.error("[Worker] _fnToExpr: function source appears minified or native, Worker may fail");
-            TU.Safe && TU.Safe.GlobalErrorBoundary && TU.Safe.GlobalErrorBoundary.record('worker:fnToExpr', new Error('Function source unavailable: ' + s.slice(0, 50)));
-          }
+          // For class methods, toString() returns "name(args){...}" which isn't a valid expression
+          // Prefix with "function " to make it a valid function expression.
           return s.startsWith("function") ? s : "function " + s;
         }
         class WorldWorkerClient {
@@ -36829,9 +36622,7 @@ window.addEventListener("load", () => {
       player: buildPlayerPayload(g),
       w: world.w,
       h: world.h,
-      diffs: SaveSystem._encodeDiff ? SaveSystem._encodeDiff(ss.diff, world.w) : { fmt: "rle1", w: world.w, data: [] },
-      // [REFACTOR Part4] Block palette mapping for ID-drift protection
-      blockPalette: window.BlockRegistry ? window.BlockRegistry.buildPalette() : null
+      diffs: SaveSystem._encodeDiff ? SaveSystem._encodeDiff(ss.diff, world.w) : { fmt: "rle1", w: world.w, data: [] }
     };
   }
 
@@ -36846,9 +36637,7 @@ window.addEventListener("load", () => {
       timeOfDay: TU.Utils && TU.Utils.clamp ? TU.Utils.clamp(g.timeOfDay || .35, 0, 1) : g.timeOfDay,
       player: buildPlayerPayload(g),
       w: world.w,
-      h: world.h,
-      // [REFACTOR Part4] Block palette for lite saves too
-      blockPalette: window.BlockRegistry ? window.BlockRegistry.buildPalette() : null
+      h: world.h
     };
   }
 

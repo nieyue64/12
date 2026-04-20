@@ -21558,8 +21558,8 @@ Renderer.prototype.runPostFxPipeline = function(time, depth01, reducedMotion) {
 };
 // Pre-set flags for patches that are now superseded by the pipeline
 Renderer.prototype.__weatherPostTintInstalled = true;
-// NOTE: __weatherPostTintOptimized and __underwaterFogInstalled intentionally NOT set
-// They implement actual weather tint and underwater fog rendering.
+Renderer.prototype.__weatherPostTintOptimized = true;
+Renderer.prototype.__underwaterFogInstalled = true;
 
 /**
  * Crafting system UI and logic for converting items into new items.
@@ -23428,9 +23428,6 @@ class InputManager {
     });
     // [REFACTOR Part1] Absorbed from InputManager.__tuInputSafety patch:
     // Anti-stuck-key: reset all inputs on blur/visibility change
-    // Guard: only bind once per instance
-    if (this.__tuExtraBound) return;
-    this.__tuExtraBound = true;
     const resetMouseButtons = () => {
       game && game.input && (window.GameEvents.emit('input:set', 'mouseLeft', false), window.GameEvents.emit('input:set', 'mouseRight', false));
     };
@@ -26845,8 +26842,6 @@ window.TU;
           // Subtle grain (skip on low power)
           this._grainPattern && !lowFx && (ctx.globalAlpha = .045, ctx.fillStyle = this._grainPattern, ctx.fillRect(0, 0, 0 | w, 0 | h));
           ctx.restore();
-          // [REFACTOR Part5] Pipeline call in base override (since this replaces the native method)
-          this.runPostFxPipeline && this.runPostFxPipeline(time, depth01, reducedMotion);
         };
       }
       if (Game && Game.prototype) {
